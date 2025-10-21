@@ -3,77 +3,128 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Display – UR – Dateien einfach austauschen</title>
+  <title>UR – Slideshow (automatisch, alle 15s)</title>
   <style>
-    html, body { margin:0; height:100%; background:#000; color:#fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
-    .wrap { position:fixed; inset:0; display:grid; place-items:center; padding: 6vmin; }
-    #stage { width:100%; height:100%; display:grid; place-items:center; }
-    #stage > img, #stage > video { max-width:100%; max-height:100%; object-fit:contain; background:#000; }
-    #stage > iframe, #stage > embed { width:100%; height:100%; border:0; background:#000; }
-    .msg { opacity:.7; font-size: clamp(14px, 2.5vmin, 18px); text-align:center; }
-    .hint { position: fixed; right: 10px; bottom: 10px; opacity:.6; font-size: 12px; }
+    :root { --bg:#000; --fg:#fff; --topbar:48px; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; overflow:hidden; }
+    .topbar { position:fixed; inset:0 0 auto 0; height:var(--topbar); display:flex; align-items:center; justify-content:space-between; gap:10px; padding:0 14px; background:rgba(0,0,0,.75); border-bottom:1px solid rgba(255,255,255,.08); z-index:10; }
+    .actions { display:flex; gap:8px; align-items:center; }
+    .btn { appearance:none; border:0; border-radius:10px; padding:6px 10px; background:rgba(255,255,255,.12); color:var(--fg); cursor:pointer; font-size:12px }
+    .stage { position:fixed; inset:var(--topbar) 0 0 0; display:grid; place-items:center; }
+    .stage > img, .stage > video { max-width:100%; max-height:100%; object-fit:contain; background:#000; }
+    .stage > embed, .stage > iframe { width:100%; height:100%; border:0; background:#000; }
+    .hud { position:fixed; right:10px; bottom:10px; font-size:12px; opacity:.65; }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div id="stage"><div class="msg">Suche nach Datei … (z. B. <strong>content.jpg</strong> / <strong>content.pdf</strong>)</div></div>
+  <div class="topbar">
+    <div><strong>UR</strong> – zeigt automatisch alle Dateien außer <code>index.html</code></div>
+    <div class="actions">
+      <button class="btn" id="reload">Neu laden</button>
+      <button class="btn" id="fullscreen">Vollbild</button>
+    </div>
   </div>
-  <div class="hint">UR – Dateien einfach austauschen</div>
-  
-    <script>
-      // Try to find the first existing file among common names (no editing required).
-      const candidates = [
-        "content.html","index.html.content", // guard
-        "content.jpg","content.png","content.gif","content.webp","content.svg",
-        "content.pdf",
-        "content.mp4","content.webm","content.ogg",
-        "index.jpg","index.png","index.gif","index.webp","index.svg",
-        "index.pdf",
-        "index.mp4","index.webm","index.ogg"
-      ];
-      function pickCandidate() {
-        return new Promise(async (resolve) => {
-          for (const file of candidates) {
-            try {
-              const res = await fetch(file + "?_=" + Date.now(), { method: "HEAD" });
-              if (res.ok) return resolve(file);
-            } catch (e) {}
-          }
-          resolve(null);
-        });
+  <div class="stage" id="stage"><div style="opacity:.7">Suche Dateien …</div></div>
+  <div class="hud" id="hud"></div>
+
+  <script>
+    const INTERVAL_MS = 15000;
+    const SUPPORTED = ['.jpg','.jpeg','.png','.gif','.webp','.svg','.pdf']; // erweiterbar
+    const IGNORE = ['index.html','README.md','README.txt'];
+    const RELOAD_HOURLY_MS = 60*60*1000;
+
+    function ext(name) { const i = name.lastIndexOf('.'); return i>=0 ? name.slice(i).toLowerCase() : ''; }
+    function isSupported(name) { const e = ext(name); return SUPPORTED.includes(e) && !IGNORE.includes(name.toLowerCase()); }
+    function withCB(url) { return url + (url.includes('?') ? '&' : '?') + '_=' + Date.now(); }
+
+    function guessOwnerRepo() {
+      // Erwartet Projektseiten-URL: https://OWNER.github.io/REPO/
+      const host = location.hostname; // z. B. fc09jugendfussball.github.io
+      const owner = host.split('.')[0];
+      const parts = location.pathname.split('/').filter(Boolean);
+      const repo = parts.length ? parts[0] : ''; // erster Pfadteil
+      return { owner, repo };
+    }
+
+    async function fetchContents(owner, repo) {
+      // Versuche 'main', dann 'gh-pages'
+      const branches = ['main','gh-pages'];
+      for (const ref of branches) {
+        const api = `https://api.github.com/repos/${owner}/${repo}/contents?ref=${ref}`;
+        try {
+          const res = await fetch(api);
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (Array.isArray(data)) return { list: data, ref };
+        } catch(e) {}
       }
-      function render(url) {
-        const c = document.getElementById("stage");
-        c.innerHTML = "";
-        if (!url) {
-          c.innerHTML = '<div class="msg">(Noch keine Datei gefunden. Lade z. B. <strong>content.jpg</strong> oder <strong>content.pdf</strong> hoch.)</div>';
-          return;
+      return { list: [], ref: '' };
+    }
+
+    function pickFiles(list) {
+      const files = list.filter(x => x.type === 'file' && isSupported(x.name) && !/index\.html/i.test(x.name));
+      files.sort((a,b) => a.name.localeCompare(b.name, 'de'));
+      return files.map(x => x.download_url).filter(Boolean);
+    }
+
+    function render(url) {
+      const c = document.getElementById('stage');
+      c.innerHTML = '';
+      const lower = url.toLowerCase();
+      if (lower.endsWith('.pdf')) {
+        const emb = document.createElement('embed');
+        emb.type = 'application/pdf';
+        emb.src = withCB(url) + '#view=FitH';
+        c.appendChild(emb);
+      } else if (lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.png') || lower.endsWith('.gif') || lower.endsWith('.webp') || lower.endsWith('.svg')) {
+        const img = new Image();
+        img.src = withCB(url);
+        img.alt = url;
+        c.appendChild(img);
+      } else {
+        const fr = document.createElement('iframe');
+        fr.src = withCB(url);
+        c.appendChild(fr);
+      }
+      document.getElementById('hud').textContent = url.split('/').pop();
+    }
+
+    async function init() {
+      const { owner, repo } = guessOwnerRepo();
+      if (!owner || !repo) {
+        document.getElementById('stage').innerHTML = '<div style="opacity:.7">Konnte Owner/Repo nicht ermitteln.</div>';
+        return;
+      }
+      let files = [];
+      async function loadList() {
+        const { list, ref } = await fetchContents(owner, repo);
+        files = pickFiles(list);
+        if (!files.length) {
+          document.getElementById('stage').innerHTML = '<div style="opacity:.7">Keine passenden Dateien gefunden. Lade z. B. <strong>bild.jpg</strong> oder <strong>info.pdf</strong> hoch.</div>';
         }
-        const u = url.toLowerCase();
-        if (u.endsWith(".png") || u.endsWith(".jpg") || u.endsWith(".jpeg") || u.endsWith(".gif") || u.endsWith(".webp") || u.endsWith(".svg")) {
-          const img = new Image(); img.src = url + "?_=" + Date.now(); img.alt = url; c.appendChild(img);
-        } else if (u.endsWith(".mp4") || u.endsWith(".webm") || u.endsWith(".ogg")) {
-          const v = document.createElement("video");
-          v.src = url + "?_=" + Date.now(); v.autoplay = true; v.loop = true; v.muted = true; v.controls = false; v.playsInline = true; c.appendChild(v);
-        } else if (u.endsWith(".pdf")) {
-          const emb = document.createElement("embed"); emb.type = "application/pdf"; emb.src = url + "#view=FitH"; c.appendChild(emb);
-        } else if (u.endsWith(".html") || u.endsWith(".htm")) {
-          const fr = document.createElement("iframe"); fr.src = url + "?_=" + Date.now(); c.appendChild(fr);
-        } else {
-          const fr = document.createElement("iframe"); fr.src = url + "?_=" + Date.now(); c.appendChild(fr);
-        }
       }
-      async function init() {
-        const picked = await pickCandidate();
-        render(picked);
-        // Poll for changes every minute to catch replaced files
-        setInterval(async () => {
-          const p = await pickCandidate();
-          render(p);
-        }, 60 * 1000);
+      await loadList();
+
+      let i = 0;
+      function tick() {
+        if (!files.length) return;
+        render(files[i % files.length]);
+        i++;
       }
-      init();
-    </script>
-    
+      tick();
+      setInterval(tick, INTERVAL_MS);
+      setInterval(loadList, RELOAD_HOURLY_MS);
+
+      document.getElementById('reload').addEventListener('click', async () => {
+        await loadList(); i = 0; tick();
+      });
+      document.getElementById('fullscreen').addEventListener('click', () => {
+        const root = document.documentElement;
+        if (!document.fullscreenElement) root.requestFullscreen?.(); else document.exitFullscreen?.();
+      });
+    }
+    init();
+  </script>
 </body>
 </html>
